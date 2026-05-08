@@ -117,7 +117,11 @@ impl State for CloningFromSource {
         let target_db = crate::helpers::db_name(instance);
         let source_conf = format!("{source_name}-odoo-conf");
         let target_conf = format!("{inst_name}-odoo-conf");
-        let image = instance.spec.image.as_deref().unwrap_or("odoo:18.0");
+        let image = instance
+            .spec
+            .image
+            .as_deref()
+            .unwrap_or(&ctx.defaults.odoo_image);
 
         // ── Step 2a: DB clone Job ─────────────────────────────────────
         if refresh
@@ -656,25 +660,31 @@ pub(crate) async fn maybe_retry_failed_neutralize(
 ) -> Result<bool> {
     let ns = instance.namespace().unwrap_or_default();
     let instance_name = instance.name_any();
-    let image = instance.spec.image.as_deref().unwrap_or("odoo:18.0");
+    let image = instance
+        .spec
+        .image
+        .as_deref()
+        .unwrap_or(&ctx.defaults.odoo_image);
     let current_hash = neutralize_image_hash(image);
 
     let refreshes: Api<OdooStagingRefreshJob> = Api::namespaced(ctx.client.clone(), &ns);
     let list = refreshes.list(&kube::api::ListParams::default()).await?;
 
-    // The most recently-created Failed refresh job for this instance is the
-    // one that drove us into InitFailed.  Older Failed CRs are historical
-    // artefacts the user hasn't cleaned up; ignore them.
+    // We only retry refresh jobs whose *neutralize* sub-step terminally
+    // failed — that's the only failure mode where (a) the DB and filestore
+    // work that preceded it is still good (so a retry doesn't redo the
+    // expensive clone) and (b) a spec.image edit is the realistic
+    // user-facing fix.  The aggregate `phase == Failed` is implied by the
+    // rollup whenever any sub-job is Failed, so we don't need to gate on
+    // it separately.
+    //
+    // Picking the most-recently-created candidate covers the case where
+    // the user has historical Failed refresh CRs lying around from
+    // previous attempts.
     let candidate = list
         .items
         .into_iter()
         .filter(|j| j.spec.odoo_instance_ref.name == instance_name)
-        .filter(|j| {
-            matches!(
-                j.status.as_ref().and_then(|s| s.phase.as_ref()),
-                Some(Phase::Failed)
-            )
-        })
         .filter(|j| {
             matches!(
                 j.status
