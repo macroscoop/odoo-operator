@@ -24,10 +24,25 @@ use crate::controller::helpers::{
     staging_mail_env_vars, OdooJobBuilder, FIELD_MANAGER,
 };
 use crate::controller::state_machine::scale_deployment;
+use crate::helpers::sha256_hex;
 
 const CLONE_DB_SCRIPT: &str = include_str!("../../../scripts/clone-db.sh");
 const CLONE_FILESTORE_SCRIPT: &str = include_str!("../../../scripts/clone-filestore.sh");
 const NEUTRALIZE_SCRIPT: &str = include_str!("../../../scripts/neutralize.sh");
+
+/// Number of hex characters of the image's sha256 we persist in the refresh
+/// CR's `neutralizeJobImageHash` to detect spec drift on retry.  16 chars
+/// (64 bits) is overkill for accidental-collision resistance but keeps the
+/// field readable in `kubectl get -o yaml`.
+const IMAGE_HASH_LEN: usize = 16;
+
+/// Compute the short hash recorded in `neutralizeJobImageHash`.  The
+/// neutralize retry path treats a mismatch between this and the live image
+/// as a signal to recreate the failed Job with the corrected spec.
+pub(crate) fn neutralize_image_hash(image: &str) -> String {
+    let full = sha256_hex(image);
+    full[..IMAGE_HASH_LEN.min(full.len())].to_string()
+}
 
 /// CloningFromSource: orchestrates the three-Job refresh pipeline.
 ///
@@ -403,6 +418,7 @@ impl State for CloningFromSource {
                 &json!({
                     "status": {
                         "neutralizeJobName": &k8s_job_name,
+                        "neutralizeJobImageHash": neutralize_image_hash(image),
                     }
                 }),
             )
@@ -596,6 +612,12 @@ fn build_neutralize_job(
     envs.extend(staging_mail_env_vars(instance, defaults));
     OdooJobBuilder::new(&format!("{crd_name}-neut-"), ns, refresh, instance)
         .active_deadline(1800)
+        // Allow K8s' built-in exponential backoff to absorb transient pod
+        // failures (script crashes, OOM, network blips during DB connect).
+        // ImagePullBackOff is *not* covered by backoffLimit (the Pod never
+        // exits) — that's the spec-drift retry path's responsibility, gated
+        // on `neutralizeJobImageHash`.
+        .backoff_limit(5)
         .containers(vec![Container {
             name: "neutralize".into(),
             image: Some(image.into()),
@@ -609,6 +631,121 @@ fn build_neutralize_job(
             ..Default::default()
         }])
         .build()
+}
+
+/// Spec-drift retry for the neutralize step.
+///
+/// When an OdooInstance is stuck in `InitFailed` because the staging refresh's
+/// neutralize Job hit a terminal failure (typically `ImagePullBackOff` →
+/// `DeadlineExceeded`), and the user has since corrected `spec.image`, this
+/// detects the drift via the `neutralizeJobImageHash` recorded on the
+/// failed refresh CR and resets it so the operator's normal recovery path
+/// (`InitFailed → CloningFromSource`) can re-create the neutralize Job with
+/// the corrected spec on the next reconcile tick.
+///
+/// Scope is intentionally narrow: only the neutralize sub-Job, only on a
+/// hash mismatch.  DB and filestore failures rely on `backoffLimit` for
+/// transient issues and require explicit user action otherwise.  This keeps
+/// the retry loop bounded — repeated reconciles with the same broken image
+/// don't churn (hash matches → nothing to do), only a real spec edit does.
+///
+/// Returns `true` if a reset was performed (caller may want to log).
+pub(crate) async fn maybe_retry_failed_neutralize(
+    instance: &OdooInstance,
+    ctx: &Context,
+) -> Result<bool> {
+    let ns = instance.namespace().unwrap_or_default();
+    let instance_name = instance.name_any();
+    let image = instance.spec.image.as_deref().unwrap_or("odoo:18.0");
+    let current_hash = neutralize_image_hash(image);
+
+    let refreshes: Api<OdooStagingRefreshJob> = Api::namespaced(ctx.client.clone(), &ns);
+    let list = refreshes.list(&kube::api::ListParams::default()).await?;
+
+    // The most recently-created Failed refresh job for this instance is the
+    // one that drove us into InitFailed.  Older Failed CRs are historical
+    // artefacts the user hasn't cleaned up; ignore them.
+    let candidate = list
+        .items
+        .into_iter()
+        .filter(|j| j.spec.odoo_instance_ref.name == instance_name)
+        .filter(|j| {
+            matches!(
+                j.status.as_ref().and_then(|s| s.phase.as_ref()),
+                Some(Phase::Failed)
+            )
+        })
+        .filter(|j| {
+            matches!(
+                j.status
+                    .as_ref()
+                    .and_then(|s| s.neutralize_job_phase.as_ref()),
+                Some(Phase::Failed)
+            )
+        })
+        .max_by(|a, b| a.creation_timestamp().cmp(&b.creation_timestamp()));
+
+    let Some(refresh) = candidate else {
+        return Ok(false);
+    };
+
+    let recorded_hash = refresh
+        .status
+        .as_ref()
+        .and_then(|s| s.neutralize_job_image_hash.as_deref());
+
+    if recorded_hash == Some(current_hash.as_str()) {
+        // Same image as the failed attempt — nothing changed, don't churn.
+        return Ok(false);
+    }
+
+    let crd_name = refresh.name_any();
+    let job_name = refresh
+        .status
+        .as_ref()
+        .and_then(|s| s.neutralize_job_name.as_deref());
+
+    // Best-effort cleanup of the underlying batch/v1 Job.  It's normally
+    // already gone (TTL or DeadlineExceeded), so 404 is the expected case.
+    if let Some(name) = job_name {
+        let jobs_api: Api<Job> = Api::namespaced(ctx.client.clone(), &ns);
+        match jobs_api.delete(name, &DeleteParams::background()).await {
+            Ok(_) => {}
+            Err(kube::Error::Api(ErrorResponse { code: 404, .. })) => {}
+            Err(e) => return Err(Error::Kube(e)),
+        }
+    }
+
+    // Clear the neutralize fields and reset the aggregate phase from
+    // Failed back to Running.  The snapshot rollup will then re-classify
+    // refresh_job as Active, the InitFailed → CloningFromSource transition
+    // fires, and the regular ensure() path creates a fresh neutralize Job
+    // from current spec.  The DB and filestore steps stay completed —
+    // we don't redo them.
+    patch_refresh_status(
+        &ctx.client,
+        &ns,
+        &crd_name,
+        &json!({
+            "status": {
+                "phase": Phase::Running,
+                "neutralizeJobName": Option::<String>::None,
+                "neutralizeJobPhase": Option::<Phase>::None,
+                "neutralizeJobImageHash": Option::<String>::None,
+                "message": "neutralize image changed; retrying with corrected spec",
+            }
+        }),
+    )
+    .await?;
+
+    info!(
+        crd_name = %crd_name,
+        new_image = %image,
+        new_hash = %current_hash,
+        old_hash = ?recorded_hash,
+        "neutralize spec-drift detected; cleared status to retry"
+    );
+    Ok(true)
 }
 
 fn can_refresh_with_snapshot(source_instance: &OdooInstance, dest_instance: &OdooInstance) -> bool {
